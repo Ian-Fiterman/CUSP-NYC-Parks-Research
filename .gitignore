@@ -1,0 +1,10 @@
+# Data — never commit
+data/
+
+# Notebook outputs (strip with nbstripout instead)
+*.ipynb_checkpoints/
+__pycache__/
+
+# Environment
+.env
+*.pyc
