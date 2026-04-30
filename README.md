@@ -15,7 +15,9 @@ project/
 │   ├── 03_parks.ipynb                # Park audit, property centroids, placekey lookup
 │   ├── 04_aggregation.ipynb          # Tract-level and placekey-level aggregations
 │   ├── 05_property_aggregation.ipynb # Property-level flow aggregation
-│   └── 06_analysis.ipynb             # Plots and top 10 report
+│   ├── 06_analysis.ipynb             # Plots, top 10 report, OSM-overlaid maps
+│   ├── 07_model.ipynb                # PPML gravity model (placekey and property level)
+│   └── 08_model_visualization.ipynb  # Model interpretation: distance decay, gradients, residuals
 │
 └── data/
     ├── raw/
@@ -84,9 +86,67 @@ Outputs:
 - `data/intermediate/placekey_aggregation.csv`
 
 ### 05 — Property Aggregation
-Maps each placekey to its property via the audit. Drops child POIs whose `parent_placekey` belongs to the same property to avoid double-counting visits. A tract-property pair qualifies if any POI in the property is within 10km of the tract centroid. Once qualified, visits from all POIs in that property are summed. Display distance is centroid-to-centroid (tract centroid → property polygon centroid). `all_placekeys` is populated from `property_placekeys.csv` — includes all POIs in the property, not just those with flows from that tract.
+Maps each placekey to its property via the audit. A tract-property pair qualifies if any POI in the property is within 10km of the tract centroid. Once qualified, the property's visit count for that tract is the **maximum** across all POIs in the property (not the sum). Many properties contain spatially overlapping POIs (e.g. Central Park has dozens of placekeys covering the same area), and summing would systematically double-count visitors recorded under multiple POIs. `max` is conservative — it under-counts when POIs are genuinely separate, but avoids over-counting in dense properties. This choice is under review; alternatives (hierarchical group-then-sum, visitor-overlap dedup, sum-with-cap) are documented in the notebook.
+
+Display distance is centroid-to-centroid (tract centroid → property polygon centroid). `all_placekeys` is populated from `property_placekeys.csv` — includes all POIs in the property, not just those with flows from that tract.
 
 Output: `data/output/park_flows_property_10km.csv`
+
+### 06 — Analysis
+Produces exploratory plots and a top-10 report. Loads the property flow file, parks audit, and the two aggregation files from notebook 04.
+
+Plots: visit distributions by property/tract/placekey; tract diversity (unique parks per tract); POI reach (unique tracts per POI); top-10 most-visited properties; POI visit-intensity heatmap with OSM basemap; choropleth maps of visits to Prospect Park and Central Park with OSM basemaps; combined map of all NYC park properties (light green) with Forever Wild nature areas highlighted (darker green) on top of OSM tiles.
+
+All map cells use `contextily` to fetch OpenStreetMap tiles (data is reprojected to EPSG:3857 / Web Mercator before plotting).
+
+### 07 — Model
+Fits two Poisson Pseudo-Maximum-Likelihood (PPML) gravity models — one at the placekey level, one at the property level — and compares their coefficients.
+
+**Step-by-step:**
+
+1. **Path setup** — declares all input file paths and the Census sentinel value constant.
+2. **Load data** — reads placekey flows, property flows, parks audit, and ACS demographics.
+3. **Clean ACS** — reconstructs the standard 11-digit GEOID (`geoid_full`) from the integer state/county/tract columns. Replaces Census sentinel values (`-666666666`) with `NaN`.
+4. **Impute missing ACS from spatial neighbors** — identifies tracts that appear in the flow data but lack complete ACS coverage (either absent from the ACS pull entirely, or with suppressed/missing values). For each such tract, all queen-contiguous (touching-boundary) neighbors are found using the NYC tract shapefile in EPSG:2263. Missing column values are filled with the mean of those neighbors' non-null values. Tracts absent from the ACS table entirely are added as new rows.
+5. **Build placekey model dataframe** — joins park attributes (acres, Forever Wild flag) from the audit and ACS demographics from the home tract. Computes `log_dist`, `log_area`, `log_pop`, and `is_nature`. Drops rows with any remaining NaN in model columns.
+6. **Build property model dataframe** — same as step 5 but using the property-level flow file.
+7. **PPML placekey model (#1)** — fits `visits ~ is_nature + log_dist + log_area + log_pop + is_nature × {demographic vars}` via `statsmodels` GLM with Poisson family.
+8. **PPML property model — binary nature (#2)** — same specification on the property-level data.
+9. **PPML property model — continuous nature (#3)** — same data and demographic predictors as #2, but replaces the binary `is_nature` flag with `nature_frac`, the share of the property's area that is Forever Wild (∈ [0, 1]). Both as a main effect and in every interaction term. This lets the "nature gradient" scale with how natural the park actually is rather than treating any FW designation as equivalent.
+10. **Coefficient comparison** — plots model #1 vs #2 coefficients with 95% CIs side-by-side. Model #3 prints its own summary; coefficients are not directly comparable to #2 because a unit increase in `nature_frac` (0 → 1) is not the same as flipping `is_nature`.
+
+**Model formulas:**
+
+Models #1 and #2 (binary):
+```
+visits ~ is_nature + log_dist + log_area + log_pop
+       + is_nature × median_income
+       + is_nature × {white, black, asian, aian, other_race, two_or_more}
+       + is_nature × {under_15, over_65}
+```
+
+Model #3 (continuous, property level only):
+```
+visits ~ nature_frac + log_dist + log_area + log_pop
+       + nature_frac × median_income
+       + nature_frac × {white, black, asian, aian, other_race, two_or_more}
+       + nature_frac × {under_15, over_65}
+```
+
+The interaction coefficients capture whether the demographic gradient for natural-area parks differs from that for general parks. In model #3, the slope of each demographic effect changes linearly with `nature_frac`.
+
+### 08 — Model Visualization
+Re-fits the three PPML models from notebook 07 in a condensed prep block, then explores them with interpretation plots that don't fit the workflow of the model notebook itself:
+
+1. **Distance-decay curves** — predicted visits vs distance for FW vs non-FW parks, log-y scale.
+2. **Demographic gradient panels** — for each of the 9 demographic predictors, predicted visits over the 5th–95th percentile range at FW=0 and FW=1, holding everything else at sample mean.
+3. **Continuous nature-frac gradients** — same panels for model #3, with one curve per `nature_frac` level (0, .25, .5, .75, 1.0).
+4. **Coefficient heatmap** — all three models side by side with significance stars overlaid.
+5. **Predicted vs observed** — calibration plot using decile-binned medians and 25th–75th percentile bands.
+6. **Elasticity bar chart** — % change in expected visits per +10pp / +$10k shift, separately for standard and FW parks.
+7. **Residual diagnostics** — distribution of Pearson residuals, residuals vs predicted, and top 10 over/under-predicted tract-property pairs.
+8. **Nature-frac response curve** — model #3 prediction sweeping `nature_frac` from 0 to 1 at low / median / high tract income.
+9. **Empirical attendance rates** — observed visits per 1k residents by demographic decile × FW status (no model — direct data).
 
 ---
 
@@ -119,6 +179,7 @@ One row per Advan POI. Maps each placekey to its NYC Parks property.
 | `visits` | Total `RAW_VISIT_COUNTS` across all 3 months |
 | `acres` | Property acreage from NYC Parks shapefile |
 | `forever_wild_id` | Forever Wild designation ID; null if not designated |
+| `nature_fraction` | Share of property area that is Forever Wild, ∈ [0, 1]. Computed as `sum(fw_acres) / property_acres`, clipped to [0, 1]. NaN where property `acres` is missing or non-positive. |
 
 Sort: `gis_prop_num`, `placekey`
 
@@ -175,7 +236,7 @@ One row per park POI.
 | `placekey` | Advan placekey |
 | `total_visits` | Total visits to this POI across all tracts |
 | `num_tracts` | Number of unique tracts that visited this POI |
-| `tract_list` | List of `[tract, distance_km, visits]` triplets |
+| `tract_list` | List of unique census tract GEOIDs that visited this POI |
 
 Sort: `placekey`  
 Filtered by: `MAX_DIST_KM` in `04_aggregation.ipynb` (currently disabled)
@@ -219,3 +280,6 @@ The deduplication logic in 05 drops child POIs only when their `parent_placekey`
 
 ### 3. 00_retrieval Non-Functional
 The Dewey/Advan subscription has expired. Notebook 00 cannot be re-run. The raw Advan CSVs in `data/raw/advan/` cover April–June 2022 only.
+
+### 4. ACS Neighbor Imputation Is an Approximation
+Notebook 07 step 3b imputes missing ACS values from spatial neighbors. The imputed values are means of adjacent tracts and do not reflect any sampled data. Tracts with no neighbors that have valid ACS data (e.g. isolated island tracts) remain missing and are excluded from the model via `dropna`. The imputation reduces but does not eliminate data loss in the model.
